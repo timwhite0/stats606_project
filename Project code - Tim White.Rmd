@@ -1,0 +1,1237 @@
+---
+title: "STATS 606 - Project code"
+author: "Tim White"
+date: "Due April 14th, 2023"
+output: pdf_document
+---
+
+```{r setup, include = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(expm)
+library(EMCluster)
+library(clusterGeneration)
+library(mclust)
+library(mixtools)
+library(tidyverse)
+library(doParallel)
+library(doRNG)
+registerDoParallel()
+```
+
+\pagenumbering{gobble}
+
+\renewcommand*\contentsname{Contents}
+
+\setcounter{tocdepth}{2}
+
+\footnotesize
+
+\tableofcontents
+
+\normalsize
+
+\pagebreak
+
+\pagenumbering{arabic}
+
+
+
+# Functions
+
+## `generate_data()`
+
+```{r generate_data function, warning = FALSE, cache = TRUE}
+generate_data = function(n, p, K, sepVal) {
+  # Inputs:
+  #   n = number of rows
+  #   p = number of columns
+  #   K = number of mixture components
+  #   sepVal = index of separation between components
+  # Outputs:
+  #   X = n by p data matrix
+  #   cluster = n by 1 vector of true component assignments
+  #   pi_star = K by 1 vector of true mixing proportions
+  #   mu_star = K by p matrix of true component means
+  
+  # Generate clustered data
+  cluster_data = genRandomClust(numClust = K, sepVal = sepVal, numNonNoisy = p,
+                                numNoisy = 0, numOutlier = 0, numReplicate = 1,
+                                covMethod = "eigen", ratioLambda = 1,
+                                clustszind = 1, clustSizeEq = n/K + 25,
+                                fileName = "cluster_data")
+  
+  points_and_clusters_orig = cbind(cluster_data$datList$cluster_data_1,
+                                   cluster_data$memList$cluster_data_1)
+  points_and_clusters = points_and_clusters_orig[sample(1:nrow(points_and_clusters_orig), n),]
+  
+  X = points_and_clusters[,1:p]
+  
+  cluster = points_and_clusters[,p+1]
+  
+  # Compute true pi and mu
+  pi_star = sapply(1:K, function(k) {return(mean(cluster == k))})
+  mu_star = t(sapply(1:K, function(k) {return(apply(X[cluster == k,], 2, mean))}))
+
+  return(list(X = X, cluster = cluster, pi_star = pi_star, mu_star = mu_star))  
+}
+```
+
+
+
+\newpage
+
+## `initialize_random()`
+
+```{r initialize_random function, cache = TRUE}
+initialize_random = function(X, K) {
+  # Inputs:
+  #   X = n by p data matrix
+  #   K = number of mixture components
+  # Outputs:
+  #   pi_init = initialized vector of mixing proportions
+  #   mu_init = initialized matrix of component means
+  #   sigma_init = initialized list of component covariance matrices
+  
+  n = nrow(X)
+  p = ncol(X)
+  
+  pi_init = rep(1/K, K)
+  mu_init = X[sample(1:n, K),]
+  sigma_init = replicate(K, diag(p), simplify = FALSE)
+  
+  return(list(pi_init = pi_init, mu_init = mu_init, sigma_init = sigma_init))
+}
+```
+
+
+
+\newpage
+
+## `gmmEM()`
+
+```{r EM function, cache = TRUE}
+gmmEM = function(data, K, tol, max_iter, pi_init, mu_init, sigma_init) {
+  # Inputs:
+  #   data = objected produced by generate_data()
+  #   K = number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  #   pi_init = initialized vector of mixing proportions
+  #   mu_init = initialized matrix of component means
+  #   sigma_init = initialized list of component covariance matrices
+  # Outputs:
+  #   num_iterations = number of iterations before convergence
+  #   pi_hat = estimate of pi
+  #   mu_hat = estimate of mu
+  #   sigma_hat = estimate of sigma
+  #   posterior_prob_hat = estimated posterior probability that each observation
+  #                         belongs to each component
+  #   cluster_pred = predicted component assignments
+  #   loglikelihood = vector of loglikelihood values from each iteration
+  #   abs_diff_norm_mu = absolute difference between Frobenius norms of
+  #                       initialized mu and true mu
+  
+  # Identify dimensions of X
+  n = nrow(data$X)
+  p = ncol(data$X)
+  
+  # Compute absolute difference between Frobenius norms of initialized mu and true mu
+  abs_diff_norm_mu = abs(sqrt(sum(diag(t(mu_init) %*% mu_init))) -
+                           sqrt(sum(diag(t(data$mu_star) %*% data$mu_star))))
+  
+  # Set relative difference in loglikelihoods equal to tol for start of loop
+  rel_diff_loglikelihood = tol
+  
+  # Set number of iterations equal to zero
+  iter = 0
+  
+  # Initialize pi, mu, and sigma for iteration t
+  pi_t = pi_init
+  mu_t = mu_init
+  sigma_t = sigma_init
+  
+  # Initialize vector to store loglikelihood
+  loglikelihood = numeric()
+
+  while (rel_diff_loglikelihood >= tol & iter < max_iter) {
+    
+    # Increment number of iterations
+    iter = iter + 1
+    
+    
+    
+    ### E step
+    # Compute posterior probabilities
+    compute_kth_density = function(k, pi, mu, sigma) {
+      
+      covmat = if (!matrixcalc::is.symmetric.matrix(sigma[[k]])) {
+                  if (matrixcalc::is.positive.definite(
+                                    as.matrix(symmpart(Matrix(sigma[[k]],
+                                                              sparse = TRUE))))) {
+                    symmpart(Matrix(sigma[[k]], sparse = TRUE))
+                  } else {
+                    Matrix(diag(nrow(sigma[[k]])), sparse = TRUE)
+                  }
+                } else {
+                  if (matrixcalc::is.positive.definite(sigma[[k]])) {
+                    Matrix(sigma[[k]], sparse = TRUE)
+                  } else {
+                    Matrix(diag(nrow(sigma[[k]])), sparse = TRUE)
+                  }
+                }
+      
+      return(pi[k] * sparseMVN::dmvn.sparse(data$X,
+                                 mu[k,],
+                                 CH = Cholesky(covmat),
+                                 prec = FALSE, log = FALSE))
+    }
+    
+    numerator_t = lapply(1:K, compute_kth_density,
+                         pi = pi_t, mu = mu_t, sigma = sigma_t)
+    denominator_t = Reduce("+", numerator_t) + 0.000000001
+    
+    compute_kth_posterior_probs = function(k, numerator, denominator) {
+      return(numerator[[k]]/denominator)
+    }
+    
+    posterior_probs_t1 = sapply(1:K, compute_kth_posterior_probs, numerator_t, denominator_t)
+    
+    
+    
+    ### M step
+    # Update pi
+    pi_t1 = colMeans(posterior_probs_t1)
+    
+    # Update mu
+    mu_t1 = (t(posterior_probs_t1) %*% data$X)/colSums(posterior_probs_t1)
+    
+    # Update sigma
+    compute_kth_sigma = function(k, X, mu, posterior_probs) {
+      X_centered = X - rep(1,n) %*% t(mu[k,])
+      num = t(X_centered) %*% (posterior_probs[,k] * (X_centered))
+      denom = sum(posterior_probs[,k]) + 0.000000001
+      return(num/denom)
+    }
+
+    sigma_t1 = lapply(1:K, compute_kth_sigma, data$X, mu_t1, posterior_probs_t1)
+    
+    
+    
+    ### Compute metrics for the current iteration
+    # Compute loglikelihood
+    loglikelihood = append(loglikelihood,
+                           sum(log(Reduce("+",
+                                          lapply(1:K, compute_kth_density,
+                                                 pi = pi_t1, mu = mu_t1, sigma = sigma_t1)))))
+
+    rel_diff_loglikelihood = (loglikelihood[iter] - 
+                                ifelse(iter == 1,
+                                       sum(log(Reduce("+",
+                                              lapply(1:K, compute_kth_density,
+                                                     pi = pi_t, mu = mu_t,
+                                                     sigma = sigma_t)) + 0.000000001)),
+                                       loglikelihood[iter - 1]))/
+                              (loglikelihood[iter] -
+                                 ifelse(iter == 1,
+                                        sum(log(Reduce("+",
+                                               lapply(1:K, compute_kth_density,
+                                                      pi = pi_t, mu = mu_t,
+                                                      sigma = sigma_t)) + 0.000000001)),
+                                        loglikelihood[1]) + 0.000000001)
+    
+    # Reset parameter estimates for next iteration
+    pi_t = pi_t1
+    mu_t = mu_t1
+    sigma_t = sigma_t1
+  }
+  
+  # Predict clusters based on posterior_probs_t1
+  cluster_pred = apply(posterior_probs_t1, 1, function(row) {which.max(row)})
+  
+  return(list(num_iterations = iter, pi_hat = pi_t, mu_hat = mu_t, sigma_hat = sigma_t,
+              posterior_prob_hat = posterior_probs_t1, cluster_pred = cluster_pred,
+              loglikelihood = loglikelihood, abs_diff_norm_mu = abs_diff_norm_mu))
+}
+```
+
+
+
+\newpage
+
+## `randomEM()`
+
+```{r randomEM function, cache = TRUE}
+randomEM = function(data, K, tol, max_iter) {
+  # Inputs:
+  #   data = objected produced by generate_data()
+  #   K = number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  # Outputs:
+  #   EM = objected produced by gmmEM()
+  #   time = runtime of algorithm
+  
+  # Record start time
+  start = Sys.time()
+  
+  # Initialize pi, mu, and sigma randomly
+  init = initialize_random(data$X, K)
+  
+  # Run EM with randomly initialized pi, mu, and sigma
+  EM = gmmEM(data, K, tol, max_iter,
+             pi_init = init$pi_init,
+             mu_init = init$mu_init,
+             sigma_init = init$sigma_init)
+  
+  # Record end time
+  end = Sys.time()
+  
+  # Compute runtime
+  time = difftime(end, start, units = "secs")
+  
+  return(list(EM = EM, time = time))
+}
+```
+
+
+
+\newpage
+
+## `fit_randomEM()`
+
+```{r fit_randomEM function, cache = TRUE}
+fit_randomEM = function(data, K_seq, tol, max_iter) {
+  # Inputs:
+  #   data = object produced by generate_data()
+  #   K_seq = vector of values of number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  # Outputs:
+  #   EM = objected produced by randomEM()
+  #   BIC = BIC of selected fit (maximizes 2*loglik - nparams*log(n)) 
+  #   K = number of mixture components in selected fit
+  #   time = runtime of selected fit
+  
+  # Run randomEM() for all values in K_seq
+  fits = foreach(K = K_seq) %dopar% randomEM(data, K, tol, max_iter)
+
+  # Compute BIC for each fit in fits
+  BICs = lapply(seq(1, length(K_seq)),
+                function(i) {
+                  bic("VVV", fits[[i]]$EM$loglikelihood[fits[[i]]$EM$num_iterations],
+                      n = nrow(data$X), d = ncol(data$X), G = K_seq[i])
+                })
+  
+  # Choose the fit that maximizes BIC
+  fit = fits[[which.max(BICs)]]
+  
+  return(list(EM = fit$EM, BIC = max(unlist(BICs)),
+              K = K_seq[which.max(BICs)], time = as.numeric(fit$time)))
+}
+```
+
+
+
+\newpage
+
+## `emEM()`
+
+```{r emEM function, cache = TRUE}
+emEM = function(data, K, tol, max_iter, num_start = 3) {
+  # Inputs:
+  #   data = objected produced by generate_data()
+  #   K = number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  #   num_start = number of candidate starting values for mu
+  # Outputs:
+  #   EM = objected produced by gmmEM()
+  #   time = runtime of algorithm
+  
+  # Record start time
+  start = Sys.time()
+  
+  # Create empty sequences for pi, mu, sigma, and loglikelihood
+  pi_seq = list()
+  mu_seq = list()
+  sigma_seq = list()
+  loglikelihood_seq = numeric(num_start)
+  
+  for (i in 1:num_start) {
+    # Initialize randomly
+    init = initialize_random(data$X, K)
+    
+    # Short run of EM with random initialization
+    EM = gmmEM(data, K, tol = tol^(1/4), max_iter = nrow(data$X),
+               pi_init = init$pi_init, mu_init = init$mu_init, sigma_init = init$sigma_init)
+    
+    # Store ith estimates of pi, mu, and sigma
+    pi_seq[[i]] = EM$pi_hat
+    mu_seq[[i]] = EM$mu_hat
+    sigma_seq[[i]] = EM$sigma_hat
+    
+    # Store ith loglikelihood
+    loglikelihood_seq[i] = EM$loglikelihood[EM$num_iterations]
+  }
+  
+  # Long run of EM initialized with pi, mu, and sigma that maximize loglikelihood
+  EM = gmmEM(data, K, tol, max_iter,
+             pi_init = pi_seq[[which.max(loglikelihood_seq)]],
+             mu_init = mu_seq[[which.max(loglikelihood_seq)]],
+             sigma_init = sigma_seq[[which.max(loglikelihood_seq)]])
+  
+  # Record end time
+  end = Sys.time()
+  
+  # Compute runtime
+  time = difftime(end, start, units = "secs")
+  
+  return(list(EM = EM, time = time))
+}
+```
+
+
+
+\newpage
+
+## `fit_emEM()`
+
+```{r fit_emEM function, cache = TRUE}
+fit_emEM = function(data, K_seq, tol, max_iter, num_start = 3) {
+  # Inputs:
+  #   data = object produced by generate_data()
+  #   K_seq = vector of values of number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  #   num_start = number of candidate starting values for mu
+  # Outputs:
+  #   EM = objected produced by emEM()
+  #   BIC = BIC of selected fit (maximizes 2*loglik - nparams*log(n)) 
+  #   K = number of mixture components in selected fit
+  #   time = runtime of selected fit
+  
+  # Run emEM() for all values in K_seq
+  fits = foreach(K = K_seq) %dopar% emEM(data, K, tol, max_iter, num_start)
+
+  # Compute BIC for each fit in fits
+  BICs = lapply(seq(1, length(K_seq)),
+                function(i) {
+                  bic("VVV", fits[[i]]$EM$loglikelihood[fits[[i]]$EM$num_iterations],
+                      n = nrow(data$X), d = ncol(data$X), G = K_seq[i])
+                })
+  
+  # Choose the fit that maximizes BIC
+  fit = fits[[which.max(BICs)]]
+  
+  return(list(EM = fit$EM, BIC = max(unlist(BICs)),
+              K = K_seq[which.max(BICs)], time = as.numeric(fit$time)))
+}
+```
+
+
+
+\newpage
+
+## `svdEM()`
+
+```{r svdEM function, cache = TRUE}
+svdEM = function(data, K, tol, max_iter) {
+  # Inputs:
+  #   data = objected produced by generate_data()
+  #   K = number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  # Outputs:
+  #   EM = objected produced by gmmEM()
+  #   time = runtime of algorithm
+  
+  # Record start time
+  start = Sys.time()
+  
+  # Identify number of columns of X
+  p = ncol(data$X)
+  
+  # Initialize pi and mu with SVD
+  init = starts.via.svd(data$X, nclass = K, method = "em")
+  
+  # Initialize sigma with SVD
+  sigma_init = lapply(1:K, function(k) {
+                  sigma = matrix(0, nrow = p, ncol = p)
+                  sigma[upper.tri(sigma, diag = TRUE)] = init$LTSigma[k,]
+                  sigma_init = sigma + t(sigma) - diag(diag(sigma))
+                  return(sigma_init)
+                })
+  
+  # Run EM with SVD-initialized parameters
+  EM = gmmEM(data, K, tol, max_iter,
+             pi_init = init$pi,
+             mu_init = init$Mu,
+             sigma_init = sigma_init)
+  
+  # Record end time
+  end = Sys.time()
+  
+  # Compute runtime
+  time = difftime(end, start, units = "secs")
+  
+  return(list(EM = EM, time = time))
+}
+```
+
+
+
+\newpage
+
+## ``fit_svdEM()``
+
+```{r fit_svdEM function, cache = TRUE}
+fit_svdEM = function(data, K_seq, tol, max_iter) {
+  # Inputs:
+  #   data = object produced by generate_data()
+  #   K_seq = vector of values of number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  # Outputs:
+  #   EM = objected produced by svdEM()
+  #   BIC = BIC of selected fit (maximizes 2*loglik - nparams*log(n)) 
+  #   K = number of mixture components in selected fit
+  #   time = runtime of selected fit
+  
+  # Run svdEM() for all values in K_seq
+  fits = foreach(K = K_seq) %dopar% svdEM(data, K, tol, max_iter)
+
+  # Compute BIC for each fit in fits
+  BICs = lapply(seq(1, length(K_seq)),
+                function(i) {
+                  bic("VVV", fits[[i]]$EM$loglikelihood[fits[[i]]$EM$num_iterations],
+                      n = nrow(data$X), d = ncol(data$X), G = K_seq[i])
+                })
+  
+  # Choose the fit that maximizes BIC
+  fit = fits[[which.max(BICs)]]
+  
+  return(list(EM = fit$EM, BIC = max(unlist(BICs)),
+              K = K_seq[which.max(BICs)], time = as.numeric(fit$time)))
+}
+```
+
+
+
+\newpage
+
+## `kmEM()`
+
+```{r kmEM function, cache = TRUE}
+kmEM = function(data, K, tol, max_iter) {
+  # Inputs:
+  #   data = objected produced by generate_data()
+  #   K = number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  # Outputs:
+  #   EM = objected produced by gmmEM()
+  #   time = runtime of algorithm
+  
+  # Record start time
+  start = Sys.time()
+  
+  # Initialize pi, mu, and sigma using K-means
+  init = kmeans(data$X, centers = K, nstart = nrow(data$X))
+  pi_init = init$size/sum(init$size)
+  mu_init = init$centers
+  sigma_init = initialize_random(data$X, K)$sigma_init
+  
+  # Run EM with K-means initialized parameters
+  EM = gmmEM(data, K, tol, max_iter,
+             pi_init = pi_init,
+             mu_init = mu_init,
+             sigma_init = sigma_init)
+  
+  # Record end time
+  end = Sys.time()
+  
+  # Compute runtime
+  time = difftime(end, start, units = "secs")
+  
+  return(list(EM = EM, time = time))
+}
+```
+
+
+
+\newpage
+
+## `fit_kmEM()`
+
+```{r fit_kmEM function, cache = TRUE}
+fit_kmEM = function(data, K_seq, tol, max_iter) {
+  # Inputs:
+  #   data = object produced by generate_data()
+  #   K_seq = vector of values of number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  # Outputs:
+  #   EM = objected produced by kmEM()
+  #   BIC = BIC of selected fit (maximizes 2*loglik - nparams*log(n)) 
+  #   K = number of mixture components in selected fit
+  #   time = runtime of selected fit
+  
+  # Run kmEM() for all values in K_seq
+  fits = foreach(K = K_seq) %dopar% kmEM(data, K, tol, max_iter)
+
+  # Compute BIC for each fit in fits
+  BICs = lapply(seq(1, length(K_seq)),
+                function(i) {
+                  bic("VVV", fits[[i]]$EM$loglikelihood[fits[[i]]$EM$num_iterations],
+                      n = nrow(data$X), d = ncol(data$X), G = K_seq[i])
+                })
+  
+  # Choose the fit that maximizes BIC
+  fit = fits[[which.max(BICs)]]
+  
+  return(list(EM = fit$EM, BIC = max(unlist(BICs)),
+              K = K_seq[which.max(BICs)], time = as.numeric(fit$time)))
+}
+```
+
+
+
+\newpage
+
+## `plot_results()`
+
+```{r plot_results function, cache = TRUE}
+plot_results = function(data, K, EM) {
+  # Inputs:
+  #   data = objected produced by generate_data()
+  #   K = number of mixture components
+  #   EM = object produced by gmmEM(), randomEM(), emEM(), svdEM(), or kmEM()
+  # Outputs:
+  #   plot_clusters = function that plots X1 vs X2, colored by true cluster with
+  #                     predicted clusters overlaid using ellipses (only for p = 2)
+  #   plot_loglikelihood = plot of loglikelihood for each iteration
+  
+  palette(c("dodgerblue3", "indianred3", "gray70", "olivedrab3", "purple3", "hotpink1",
+            "darkorange1", "goldenrod1", "navajowhite3", "cyan3", "green4", "rosybrown3"))
+  
+  # If p = 2, plot X1 vs X2 colored by cluster with predicted clusters overlaid
+  if (ncol(EM$mu_hat) == 2) {
+    plot_clusters = function() {
+      plot(data$X, col = data$cluster, pch = 19, xlab = "X1", ylab = "X2")
+      invisible(lapply(1:K, function(k) {ellipse(mu = as.vector(EM$mu_hat[k,]),
+                                         sigma = as.matrix(EM$sigma_hat[[k]]),
+                                         alpha = 0.05, lwd = 3)}))
+    }
+  }
+  else if (ncol(EM$mu_hat) != 2) {
+    plot_clusters = NULL
+  }
+  
+  # Create data frame for plots
+  plot_data = tibble(iterations = seq(from = 1, to = EM$num_iterations, by = 1),
+                     loglikelihood = EM$loglikelihood)
+  
+  # Plot loglikelihood by number of iterations
+  plot_loglikelihood = plot_data %>%
+                        ggplot(aes(x = iterations, y = loglikelihood)) +
+                          geom_line(col = "darkslategray", linewidth = 1) +
+                          labs(x = "Number of iterations", y = "Loglikelihood") +
+                          theme_classic()
+  
+  return(list(plot_clusters = plot_clusters,
+              plot_loglikelihood = plot_loglikelihood))
+}
+```
+
+
+
+\newpage
+
+## `compare_methods()`
+
+```{r compare_methods function, warning = FALSE, cache = TRUE}
+compare_methods = function(n, p, true_K, sepVal, K_seq, tol, max_iter) {
+  # Inputs:
+  #   n = number of rows in data matrix
+  #   p = number of columns in data matrix
+  #   true_K = true number of mixture components
+  #   sepVal = index of separation between mixture components
+  #   K_seq = vector of values of number of mixture components
+  #   tol = convergence tolerance
+  #   max_iter = maximum number of iterations allowed
+  # Outputs:
+  #   results = table summarizing performance of randomEM, emEM, svdEM, and
+  #             kmEM; columns record name of method, adjusted Rand index,
+  #             estimated number of mixture components, difference between
+  #             Frobenius norm of estimated mu and true mu, number of iterations
+  #             before convergence, and runtime (in seconds)
+  
+  # Generate data
+  data = generate_data(n = n, p = p, K = true_K, sepVal = sepVal)
+  
+  # Apply the four methods
+  random = fit_randomEM(data, K_seq, tol, max_iter)
+  em = fit_emEM(data, K_seq, tol, max_iter, num_start = 3)
+  svd = fit_svdEM(data, K_seq, tol, max_iter)
+  km = fit_kmEM(data, K_seq, tol, max_iter)
+  
+  # Summarize performance of the four methods
+  results = tibble(
+    method = c("randomEM", "emEM", "svdEM", "kmEM"),
+    BIC_rank = order(c(random$BIC, em$BIC, svd$BIC, km$BIC), decreasing = TRUE),
+    rand = c(adjustedRandIndex(data$cluster, random$EM$cluster_pred),
+             adjustedRandIndex(data$cluster, em$EM$cluster_pred),
+             adjustedRandIndex(data$cluster, svd$EM$cluster_pred),
+             adjustedRandIndex(data$cluster, km$EM$cluster_pred)),
+    K = c(random$K, em$K, svd$K, km$K),
+    diff_norm_mu = c(random$EM$abs_diff_norm_mu,
+                     em$EM$abs_diff_norm_mu,
+                     svd$EM$abs_diff_norm_mu,
+                     km$EM$abs_diff_norm_mu),
+    num_iter = c(random$EM$num_iterations,
+                 em$EM$num_iterations,
+                 svd$EM$num_iterations,
+                 km$EM$num_iterations),
+    time = c(random$time, em$time, svd$time, km$time)
+  )
+  
+  return(results)
+}
+```
+
+
+
+
+
+\newpage
+
+# Demonstration of initialization strategies
+
+```{r demonstration random results, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+# Generate example data
+example_data = generate_data(n = 1200, p = 2, K = 12, sepVal = 0.25)
+
+
+
+# Run randomEM three times
+example_randomEM = list(); example_plots = list()
+
+for (i in 1:3) {
+  example_randomEM[[i]] = randomEM(data = example_data, K = 12,
+                                   tol = 1e-4, max_iter = 1000)
+  example_plots[[i]] = plot_results(data = example_data, K = 12,
+                                    EM = example_randomEM[[i]]$EM)
+}
+
+
+
+# Report maximum loglikelihood for each run
+knitr::kable(t(sapply(1:3,
+                 function(i) {
+                   round(max(example_randomEM[[i]]$EM$loglikelihood), 3)})),
+                 align = "c", col.names = c("Run 1", "Run 2", "Run 3"))
+
+
+
+# Report adjusted Rand index for each run
+knitr::kable(t(sapply(1:3,
+                 function(i) {
+                   round(adjustedRandIndex(
+                            example_data$cluster,
+                            example_randomEM[[i]]$EM$cluster_pred), 3)})),
+             align = "c", col.names = c("Run 1", "Run 2", "Run 3"))
+```
+
+
+
+\newpage
+
+```{r demonstration random plots, warning = FALSE, cache = TRUE, fig.align = 'center', out.width="60%"}
+# Plot clusters for each run
+example_plots[[1]]$plot_clusters()
+example_plots[[2]]$plot_clusters()
+example_plots[[3]]$plot_clusters()
+```
+
+
+
+\newpage
+
+```{r demonstration other results, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+# Run emEM, svdEM, and kmEM
+example_emEM = emEM(data = example_data, K = 12,
+                    tol = 1e-4, max_iter = 1000)
+example_svdEM = svdEM(data = example_data, K = 12,
+                      tol = 1e-4, max_iter = 1000)
+example_kmEM = kmEM(data = example_data, K = 12,
+                    tol = 1e-4, max_iter = 1000)
+
+
+
+# Report maximum loglikelihood for each method
+knitr::kable(round(t(c(max(example_emEM$EM$loglikelihood),
+               max(example_svdEM$EM$loglikelihood),
+               max(example_kmEM$EM$loglikelihood))), 3),
+             align = "c", col.names = c("emEM", "svdEM", "kmEM"))
+
+
+
+# Report adjusted Rand index for each method
+knitr::kable(round(t(c(adjustedRandIndex(example_data$cluster,
+                                 example_emEM$EM$cluster_pred),
+               adjustedRandIndex(example_data$cluster,
+                                 example_svdEM$EM$cluster_pred),
+               adjustedRandIndex(example_data$cluster,
+                                 example_kmEM$EM$cluster_pred))), 3),
+             align = "c", col.names = c("emEM", "svdEM", "kmEM"))
+```
+
+
+
+\newpage
+
+```{r demonstration other plots, warning = FALSE, cache = TRUE, fig.align = 'center', out.width="60%"}
+# Plot clusters for each method
+plot_results(data = example_data,
+             K = 12, EM = example_emEM$EM)$plot_clusters()
+plot_results(data = example_data,
+             K = 12, EM = example_svdEM$EM)$plot_clusters()
+plot_results(data = example_data,
+             K = 12, EM = example_kmEM$EM)$plot_clusters()
+```
+
+
+
+
+
+\newpage
+
+# Simulation studies for $K = 5$
+
+```{r results K5, warning = FALSE, cache = TRUE}
+# Set sample size and number of data sets to simulate
+n = 500
+num_datasets = 20
+
+# Set true number of mixture components and values to try
+true_K = 5
+K_seq = c(4, 5, 6)
+```
+
+
+
+## $p = 2$, $\texttt{sepVal} = 0.01$
+
+```{r results K5, p2, sep0.01, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K5_1 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 2,
+                                  true_K = true_K,
+                                  sepVal = 0.01,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K5, p2, sep0.01, warning = FALSE, cache = TRUE}
+knitr::kable(results_K5_1 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                     rand = round(rand, 3),
+                                     K = format(round(K, 1), nsmall = 1),
+                                     diff_norm_mu = round(diff_norm_mu, 3),
+                                     num_iter = round(num_iter, 1),
+                                     time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 2$, $\texttt{sepVal} = 0.15$
+
+```{r results K5, p2, sep0.15, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K5_2 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 2,
+                                  true_K = true_K,
+                                  sepVal = 0.15,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K5, p2, sep0.15, warning = FALSE, cache = TRUE}
+knitr::kable(results_K5_2 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                     rand = round(rand, 3),
+                                     K = format(round(K, 1), nsmall = 1),
+                                     diff_norm_mu = round(diff_norm_mu, 3),
+                                     num_iter = round(num_iter, 1),
+                                     time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 2$, $\texttt{sepVal} = 0.3$
+
+```{r results K5, p2, sep0.3, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K5_3 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 2,
+                                  true_K = true_K,
+                                  sepVal = 0.3,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K5, p2, sep0.3, warning = FALSE, cache = TRUE}
+knitr::kable(results_K5_3 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                     rand = round(rand, 3),
+                                     K = format(round(K, 1), nsmall = 1),
+                                     diff_norm_mu = round(diff_norm_mu, 3),
+                                     num_iter = round(num_iter, 1),
+                                     time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 4$, $\texttt{sepVal} = 0.01$
+
+```{r results K5, p4, sep0.01, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K5_4 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 4,
+                                  true_K = true_K,
+                                  sepVal = 0.01,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K5, p4, sep0.01, warning = FALSE, cache = TRUE}
+knitr::kable(results_K5_4 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                     rand = round(rand, 3),
+                                     K = format(round(K, 1), nsmall = 1),
+                                     diff_norm_mu = round(diff_norm_mu, 3),
+                                     num_iter = round(num_iter, 1),
+                                     time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 4$, $\texttt{sepVal} = 0.15$
+
+```{r results K5, p4, sep0.15, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K5_5 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 4,
+                                  true_K = true_K,
+                                  sepVal = 0.15,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K5, p4, sep0.15, warning = FALSE, cache = TRUE}
+knitr::kable(results_K5_5 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                     rand = round(rand, 3),
+                                     K = format(round(K, 1), nsmall = 1),
+                                     diff_norm_mu = round(diff_norm_mu, 3),
+                                     num_iter = round(num_iter, 1),
+                                     time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 4$, $\texttt{sepVal} = 0.3$
+
+```{r results K5, p4, sep0.3, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K5_6 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 4,
+                                  true_K = true_K,
+                                  sepVal = 0.3,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K5, p4, sep0.3, warning = FALSE, cache = TRUE}
+knitr::kable(results_K5_6 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                     rand = round(rand, 3),
+                                     K = format(round(K, 1), nsmall = 1),
+                                     diff_norm_mu = round(diff_norm_mu, 3),
+                                     num_iter = round(num_iter, 1),
+                                     time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+
+
+\newpage
+
+# Simulation studies for $K = 10$
+
+```{r results K10, warning = FALSE, cache = TRUE}
+# Set sample size and number of data sets to simulate
+n = 1000
+num_datasets = 20
+
+# Set true number of mixture components and values to try
+true_K = 10
+K_seq = c(9, 10, 11)
+```
+
+
+
+## $p = 2$, $\texttt{sepVal} = 0.01$
+
+```{r results K10, p2, sep0.01, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K10_1 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 2,
+                                  true_K = true_K,
+                                  sepVal = 0.01,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K10, p2, sep0.01, warning = FALSE, cache = TRUE}
+knitr::kable(results_K10_1 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                      rand = round(rand, 3),
+                                      K = format(round(K, 1), nsmall = 1),
+                                      diff_norm_mu = round(diff_norm_mu, 3),
+                                      num_iter = round(num_iter, 1),
+                                      time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 2$, $\texttt{sepVal} = 0.15$
+
+```{r results K10, p2, sep0.15, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K10_2 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 2,
+                                  true_K = true_K,
+                                  sepVal = 0.15,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K10, p2, sep0.15, warning = FALSE, cache = TRUE}
+knitr::kable(results_K10_2 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                      rand = round(rand, 3),
+                                      K = format(round(K, 1), nsmall = 1),
+                                      diff_norm_mu = round(diff_norm_mu, 3),
+                                      num_iter = round(num_iter, 1),
+                                      time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 2$, $\texttt{sepVal} = 0.3$
+
+```{r results K10, p2, sep0.3, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K10_3 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 2,
+                                  true_K = true_K,
+                                  sepVal = 0.3,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K10, p2, sep0.3, warning = FALSE, cache = TRUE}
+knitr::kable(results_K10_3 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                      rand = round(rand, 3),
+                                      K = format(round(K, 1), nsmall = 1),
+                                      diff_norm_mu = round(diff_norm_mu, 3),
+                                      num_iter = round(num_iter, 1),
+                                      time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 4$, $\texttt{sepVal} = 0.01$
+
+```{r results K10, p4, sep0.01, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K10_4 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 4,
+                                  true_K = true_K,
+                                  sepVal = 0.01,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K10, p4, sep0.01, warning = FALSE, cache = TRUE}
+knitr::kable(results_K10_4 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                      rand = round(rand, 3),
+                                      K = format(round(K, 1), nsmall = 1),
+                                      diff_norm_mu = round(diff_norm_mu, 3),
+                                      num_iter = round(num_iter, 1),
+                                      time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 4$, $\texttt{sepVal} = 0.15$
+
+```{r results K10, p4, sep0.15, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K10_5 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 4,
+                                  true_K = true_K,
+                                  sepVal = 0.15,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K10, p4, sep0.15, warning = FALSE, cache = TRUE}
+knitr::kable(results_K10_5 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                      rand = round(rand, 3),
+                                      K = format(round(K, 1), nsmall = 1),
+                                      diff_norm_mu = round(diff_norm_mu, 3),
+                                      num_iter = round(num_iter, 1),
+                                      time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+\newpage
+
+## $p = 4$, $\texttt{sepVal} = 0.3$
+
+```{r results K10, p4, sep0.3, warning = FALSE, cache = TRUE}
+set.seed(606)
+
+results_K10_6 = foreach(k = 1:num_datasets) %dorng% 
+                  compare_methods(n = n, p = 4,
+                                  true_K = true_K,
+                                  sepVal = 0.3,
+                                  K_seq = K_seq,
+                                  tol = 1e-4, max_iter = 1000) %>%
+                  bind_rows() %>%
+                  group_by(method) %>%
+                  summarize(across(BIC_rank:time,
+                                   ~ mean(.x, na.rm = TRUE)))
+```
+
+```{r table K10, p4, sep0.3, warning = FALSE, cache = TRUE}
+knitr::kable(results_K10_6 %>% mutate(BIC_rank = round(BIC_rank, 1),
+                                      rand = round(rand, 3),
+                                      K = format(round(K, 1), nsmall = 1),
+                                      diff_norm_mu = round(diff_norm_mu, 3),
+                                      num_iter = round(num_iter, 1),
+                                      time = round(time, 1)),
+             align = "c", col.names = c("Method", "BIC rank", "Adj. Rand index",
+                                        "Detected K", "Diff norm mu",
+                                        "# iterations", "Runtime"))
+```
+
+
+
+
